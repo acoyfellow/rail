@@ -1,0 +1,74 @@
+{
+  "name": "customer0-rail",
+  "account_id": "29db7c74093386544fed8046ef083a4b",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "rail.customer0.dev", "custom_domain": true }
+  ],
+  "artifacts": [
+    { "binding": "ARTIFACTS", "namespace": "rail" }
+  ],
+  "r2_buckets": [
+    { "binding": "STORE", "bucket_name": "rail-store" }
+  ],
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "containers": [
+    {
+      "class_name": "CiSandbox",
+      "image": "registry.cloudflare.com/29db7c74093386544fed8046ef083a4b/cloudflare-sandbox:0.12.1",
+      "max_instances": 16,
+      "instance_type": "standard-1"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SANDBOX", "class_name": "CiSandbox" },
+      { "name": "RAIL", "class_name": "RailDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CiSandbox", "RailDO"]
+    }
+  ],
+  "workflows": [
+    {
+      "name": "rail-ci",
+      "binding": "RAIL_WORKFLOW",
+      "class_name": "RailWorkflow"
+    }
+  ],
+  "triggers": {
+    "events": [
+      {
+        "type": "cf.artifacts.repo.pushed",
+        "filter": {
+          "namespace": "rail",
+          "repo_name": "demo-app"
+        },
+        "targets": [
+          {
+            "type": "workflow",
+            "workflow_name": "rail-ci"
+          }
+        ]
+      }
+    ]
+  },
+  "vars": {
+    "CLOUDFLARE_ACCOUNT_ID": "29db7c74093386544fed8046ef083a4b",
+    "ARTIFACTS_NAMESPACE": "rail",
+    "ARTIFACTS_REPO": "demo-app",
+    "PUBLIC_ORIGIN": "https://rail.customer0.dev"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true }
+  }
+}
