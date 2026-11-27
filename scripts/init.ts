@@ -30,7 +30,7 @@ Options:
   --bucket <name>      R2 bucket name (default: <namespace>-rail-store)
   --app-dir <path>     Existing or new app directory where starter rail.json will be written
   --out-dir <path>     Directory for generated wrangler.jsonc (default: .)
-  --dry-run            Print plan & generated files without calling cf/wrangler or writing files
+  --dry-run            Print plan & generated files without calling cf or writing files
   -h, --help           Show this help
 `);
   process.exit(0);
@@ -186,7 +186,7 @@ if (opts.dryRun) {
 
 const env = { CLOUDFLARE_ACCOUNT_ID: opts.account };
 console.log("\n1. Provisioning R2 bucket & Artifacts repo...");
-run("wrangler", ["r2", "bucket", "create", opts.bucket], env);
+run("cf", ["r2", "buckets", "create", "--name", opts.bucket], env);
 run("cf", ["artifacts", "namespaces", "create", "--namespace", opts.namespace], env);
 run("cf", ["artifacts", "namespaces", "repos", "create", opts.namespace, "--name", opts.repo], env);
 
@@ -206,6 +206,6 @@ if (opts.appDir) {
 
 console.log(`
 3. Finish setup in two commands:
-   wrangler deploy
+   bun run deploy  # (wrangler deploy until cf deploy / cloudflare.config.ts supports artifacts + event triggers)
    cd ${opts.appDir || "<your-app>"} && git remote add cf ${remote} && git push cf main
 `);

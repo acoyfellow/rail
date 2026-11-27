@@ -217,7 +217,7 @@ bun run init -- \\
   --repo <APP_NAME> \\
   --app-dir ../my-existing-app`;
 
-  const existingStep2 = `wrangler deploy`;
+  const existingStep2 = `bun run deploy`;
 
   const existingStep3 = `cd ../my-existing-app
 git remote add cf https://<CF_ACCOUNT_ID>.artifacts.cloudflare.net/git/<NAMESPACE>/<APP_NAME>.git
@@ -229,7 +229,7 @@ cd ../my-new-app && git init -b main && git add -A && git commit -m "init"
 
 cd ../rail
 bun run init -- --account <CF_ACCOUNT_ID> --namespace <NAMESPACE> --repo my-new-app --app-dir ../my-new-app
-wrangler deploy`;
+bun run deploy`;
 
   const railJsonExample = `{
   "branch": "main",

@@ -42,8 +42,10 @@ What `rail init` does:
 ### 2. Deploy the `rail` control plane
 
 ```sh
-wrangler deploy
+bun run deploy
 ```
+
+> **Note on `cf` CLI:** `rail init` uses `cf` for all resource provisioning (`cf r2 buckets create`, `cf artifacts ...`). `bun run deploy` calls `wrangler deploy` today because `cf deploy` requires `cloudflare.config.ts`, whose schema in `cf 1.0.0-rc.2` / `wrangler 4.165.0` does not yet include `artifacts` bindings or `cf.artifacts.repo.pushed` event triggers.
 
 *(If your account doesn't have `cloudflare-sandbox:0.12.1` in `registry.cloudflare.com` yet, mirror it once without Docker using `crane copy --platform linux/amd64 docker.io/cloudflare/sandbox:0.12.1 registry.cloudflare.com/<ACCOUNT_ID>/cloudflare-sandbox:0.12.1`, or point `containers[0].image` at a local `./Dockerfile`.)*
 
