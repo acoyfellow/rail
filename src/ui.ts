@@ -306,6 +306,7 @@ wrangler deploy`;
     <div class="card">
       <div class="tabs" role="tablist">
         <button class="tab active" type="button" data-tab="existing">Existing app</button>
+        <button class="tab" type="button" data-tab="pi">Pi / Agent</button>
         <button class="tab" type="button" data-tab="new">New app from scratch</button>
         <button class="tab" type="button" data-tab="config">rail.json (optional)</button>
       </div>
@@ -322,6 +323,18 @@ wrangler deploy`;
         <div class="step-line">
           <span class="step-label"><strong>3. Push your app</strong> — green builds deploy automatically; red builds fail closed:</span>
           ${codeBlock(existingStep3)}
+        </div>
+      </div>
+
+      
+      <div class="pane" id="pane-pi">
+        <div class="step-line">
+          <span class="step-label"><strong>Pi coding agent</strong> — installs <code>rail_init</code>, <code>rail_push</code>, <code>rail_status</code>, and <code>rail_receipt</code>:</span>
+          ${codeBlock("pi install git:github.com/acoyfellow/rail")}
+        </div>
+        <div class="step-line">
+          <span class="step-label"><strong>Claude Code / Codex / any MCP client</strong> — connect directly to <code>POST /mcp</code> (<code>repo.status</code>, <code>repo.receipts</code>, <code>repo.receipt</code>):</span>
+          ${codeBlock("https://rail.customer0.dev/mcp")}
         </div>
       </div>
 

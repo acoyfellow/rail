@@ -24,5 +24,20 @@
   },
   "bin": {
     "rail": "./scripts/init.ts"
+  },
+  "keywords": [
+    "pi-package",
+    "cloudflare",
+    "workers",
+    "ci-cd",
+    "agents"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi/index.ts"
+    ],
+    "skills": [
+      "./skills/rail"
+    ]
   }
 }

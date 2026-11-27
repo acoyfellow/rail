@@ -8,6 +8,16 @@ Minimal, owner-operated trunk-based CI/CD running entirely on Cloudflare primiti
 
 ---
 
+## Use with Pi (or Claude Code / Codex)
+
+```sh
+pi install git:github.com/acoyfellow/rail
+```
+
+Adds `rail_init`, `rail_push` (pushes to Cloudflare Artifacts and waits for the verified `PASS`/`FAIL` receipt), `rail_status`, and `rail_receipt`. Point `RAIL_URL` at your own rail Worker (defaults to `https://rail.customer0.dev`). Claude Code / Codex can connect directly via MCP at `POST /mcp`.
+
+---
+
 ## Add `rail` to an existing app (3 steps)
 
 ### 1. Provision & generate `wrangler.jsonc`
