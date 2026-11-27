@@ -5,6 +5,7 @@ export interface ArtifactsRepo {
   createToken(scope: "read" | "write", expiresInSeconds?: number): Promise<{ plaintext: string }>;
   readCommit?(hash: string): Promise<{ treeHash: string } | null>;
   readTree?(hash: string): Promise<Array<{ name: string; mode: string; hash: string; type: "blob" | "tree" | "commit" }> | null>;
+  readBlob?(hash: string): Promise<Uint8Array | string | null>;
 }
 
 export interface ArtifactsBinding {
@@ -137,6 +138,7 @@ export interface Receipt {
   steps: StepEvidence[];
   gate?: GateEvidence;
   deploy: DeployEvidence;
+  configSource?: "rail.json" | "package.json";
   capabilities: string[];
   urls: {
     human: string;

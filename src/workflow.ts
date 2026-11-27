@@ -1,5 +1,6 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
+import { resolveRailConfig, type RailConfig } from "./config";
 import type {
   ArtifactsPushEvent,
   CacheEvidence,
@@ -48,6 +49,11 @@ function cloneCommand(sha: string): string {
   ].join(" && ");
 }
 
+function decodeBlob(raw: Uint8Array | string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  return typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+}
+
 export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
   async run(event: WorkflowEvent<ArtifactsPushEvent>, step: WorkflowStep): Promise<{ receiptId: string; outcome: string }> {
     const push = event.payload;
@@ -85,7 +91,7 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
       steps: [],
       deploy: { deployed: false },
       capabilities: [
-        "artifacts:read(1h-scoped-token)",
+        "artifacts:read(10m-scoped-token-per-step)",
         "r2:cache(lockfile-sha256)",
         "sandbox:ephemeral-runners(parallel)",
         "worker-loader:preview-isolate(globalOutbound=null)",
@@ -105,148 +111,92 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
     });
 
     try {
-    // 2. Resolve lockfile cache key using Artifacts git tree reader + mint scoped read token
-    const checkoutMeta = await step.do("resolve-cache-key", async () => {
-      const repo = await this.env.ARTIFACTS.get(repoName);
-      const remote = `https://${this.env.CLOUDFLARE_ACCOUNT_ID}.artifacts.cloudflare.net/git/${namespace}/${repoName}.git`;
+      // 2. Resolve lockfile cache key & repo config (rail.json or package.json) with zero containers
+      const checkoutMeta = await step.do("resolve-cache-and-config", async () => {
+        const repo = await this.env.ARTIFACTS.get(repoName);
+        const remote = `https://${this.env.CLOUDFLARE_ACCOUNT_ID}.artifacts.cloudflare.net/git/${namespace}/${repoName}.git`;
 
-      let fingerprint = "";
-      if (repo.readCommit && repo.readTree) {
-        try {
-          const c = await repo.readCommit(after);
-          if (c) {
-            const entries = (await repo.readTree(c.treeHash)) ?? [];
-            const lockParts = entries
-              .filter((e) => e.type === "blob" && (e.name === "package.json" || e.name === "package-lock.json"))
-              .sort((a, b) => a.name.localeCompare(b.name))
-              .map((e) => `${e.name}:${e.hash}`);
-            fingerprint = lockParts.join("|");
+        let lockFingerprint = "";
+        let configFingerprint = "";
+        let railBlobHash: string | null = null;
+        let pkgBlobHash: string | null = null;
+        let resolvedConfig: RailConfig | null = null;
+
+        if (repo.readCommit && repo.readTree) {
+          try {
+            const c = await repo.readCommit(after);
+            if (c) {
+              const entries = (await repo.readTree(c.treeHash)) ?? [];
+              const lockParts = entries
+                .filter((e) => e.type === "blob" && (e.name === "package.json" || e.name === "package-lock.json"))
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map((e) => `${e.name}:${e.hash}`);
+              lockFingerprint = lockParts.join("|");
+
+              railBlobHash = entries.find((e) => e.type === "blob" && e.name === "rail.json")?.hash ?? null;
+              pkgBlobHash = entries.find((e) => e.type === "blob" && e.name === "package.json")?.hash ?? null;
+              configFingerprint = `rail:${railBlobHash ?? "none"}|pkg:${pkgBlobHash ?? "none"}`;
+
+              // Try reading blobs directly via Artifacts binding (0 containers)
+              if (repo.readBlob) {
+                const railRaw = railBlobHash ? decodeBlob(await repo.readBlob(railBlobHash).catch(() => null)) : null;
+                const pkgRaw = pkgBlobHash ? decodeBlob(await repo.readBlob(pkgBlobHash).catch(() => null)) : null;
+                if (railRaw !== null || pkgRaw !== null) {
+                  resolvedConfig = resolveRailConfig(railRaw, pkgRaw);
+                }
+              }
+            }
+          } catch {
+            // fallback handled below
           }
-        } catch {
-          // fall back to sha-based fingerprint below if tree reader unavailable
-        }
-      }
-      const lockfileHash = (await sha256Hex(fingerprint || `fallback:${after}`)).slice(0, 16);
-      const cacheKey = `cache/deps-${repoName}-${lockfileHash}.tar.gz`;
-      return { remote, lockfileHash, cacheKey };
-    });
-
-    // 3. Dependency install / R2 lockfile cache check
-    const installOut = await step.do(
-      "install-deps",
-      { retries: { limit: 2, delay: "10 seconds" }, timeout: "5 minutes" },
-      async (): Promise<{ cache: CacheEvidence; stepEvidence: StepEvidence }> => {
-        const t0 = Date.now();
-        const existing = await this.env.STORE.head(checkoutMeta.cacheKey);
-        if (existing) {
-          return {
-            cache: {
-              hit: true,
-              key: checkoutMeta.cacheKey,
-              lockfileHash: checkoutMeta.lockfileHash,
-              durationMs: Date.now() - t0,
-              bytes: existing.size,
-            },
-            stepEvidence: {
-              name: "install",
-              command: "r2-cache-restore node_modules",
-              status: "pass",
-              exitCode: 0,
-              durationMs: Date.now() - t0,
-              stdout: `Cache HIT for lockfile ${checkoutMeta.lockfileHash} (${existing.size} bytes in R2: ${checkoutMeta.cacheKey}). Skipped npm ci.`,
-              stderr: "",
-            },
-          };
         }
 
-        const sbxId = `rail-install-${receiptId}-${Date.now().toString(36)}`;
-        const sandbox = getSandbox(this.env.SANDBOX, sbxId, {
-          transport: "rpc",
-          enableDefaultSession: false,
-          containerTimeouts: { portReadyTimeoutMS: 60_000 },
-        });
-        try {
-          const repo = await this.env.ARTIFACTS.get(repoName);
-          const tok = await repo.createToken("read", 600);
-          const cloneRes = await sandbox.exec(cloneCommand(after), {
-            cwd: "/",
-            timeout: 120_000,
-            env: { ARTIFACTS_REMOTE: checkoutMeta.remote, ARTIFACTS_TOKEN: tok.plaintext },
-          });
-          if (cloneRes.exitCode !== 0) {
-            return {
-              cache: { hit: false, key: checkoutMeta.cacheKey, lockfileHash: checkoutMeta.lockfileHash, durationMs: Date.now() - t0, bytes: 0 },
-              stepEvidence: {
-                name: "install",
-                command: "git fetch && npm ci",
-                status: "fail",
-                exitCode: cloneRes.exitCode,
-                durationMs: Date.now() - t0,
-                stdout: trimLog(cloneRes.stdout),
-                stderr: trimLog(cloneRes.stderr),
-              },
-            };
+        const lockfileHash = (await sha256Hex(lockFingerprint || `fallback:${after}`)).slice(0, 16);
+        const cacheKey = `cache/deps-${repoName}-${lockfileHash}.tar.gz`;
+        const configHash = (await sha256Hex(configFingerprint || `cfg:${after}`)).slice(0, 16);
+        const configKey = `cache/cfg-${repoName}-${configHash}.json`;
+
+        if (!resolvedConfig) {
+          const cachedCfg = await this.env.STORE.get(configKey);
+          if (cachedCfg) {
+            resolvedConfig = (await cachedCfg.json()) as RailConfig;
           }
-
-          const res = await sandbox.exec(
-            "npm ci --no-audit --no-fund && tar -czf /tmp/node_modules.tar.gz -C /workspace node_modules",
-            { cwd: "/workspace", timeout: 180_000, env: { CI: "true" } }
-          );
-          if (res.exitCode !== 0) {
-            return {
-              cache: { hit: false, key: checkoutMeta.cacheKey, lockfileHash: checkoutMeta.lockfileHash, durationMs: Date.now() - t0, bytes: 0 },
-              stepEvidence: {
-                name: "install",
-                command: "npm ci --no-audit --no-fund",
-                status: "fail",
-                exitCode: res.exitCode,
-                durationMs: Date.now() - t0,
-                stdout: trimLog(res.stdout),
-                stderr: trimLog(res.stderr),
-              },
-            };
-          }
-
-          const tarFile = await sandbox.readFile("/tmp/node_modules.tar.gz", { encoding: "base64" });
-          const bytes = base64ToBytes(tarFile.content);
-          await this.env.STORE.put(checkoutMeta.cacheKey, bytes, {
-            customMetadata: { lockfileHash: checkoutMeta.lockfileHash, sha: after },
-          });
-
-          return {
-            cache: {
-              hit: false,
-              key: checkoutMeta.cacheKey,
-              lockfileHash: checkoutMeta.lockfileHash,
-              durationMs: Date.now() - t0,
-              bytes: bytes.byteLength,
-            },
-            stepEvidence: {
-              name: "install",
-              command: "npm ci --no-audit --no-fund",
-              status: "pass",
-              exitCode: 0,
-              durationMs: Date.now() - t0,
-              stdout: trimLog(res.stdout) + `\nCached node_modules (${bytes.byteLength} bytes) -> ${checkoutMeta.cacheKey}`,
-              stderr: trimLog(res.stderr),
-            },
-          };
-        } finally {
-          await sandbox.destroy().catch(() => {});
         }
-      }
-    );
 
-    const steps: StepEvidence[] = [installOut.stepEvidence];
+        return { remote, lockfileHash, cacheKey, configKey, config: resolvedConfig };
+      });
 
-    // Helper to run one check in an isolated Sandbox with cached node_modules restored from R2
-    const runParallelCheck = (name: string, command: string, captureBundle = false) =>
-      step.do(
-        `check-${name}`,
-        { retries: { limit: 2, delay: "10 seconds" }, timeout: "4 minutes" },
-        async (): Promise<{ evidence: StepEvidence; bundleKey?: string; bundleBytes?: number }> => {
+      // 3. Dependency install / R2 lockfile cache check (+ resolve rail.json if not cached yet)
+      const installOut = await step.do(
+        "install-deps",
+        { retries: { limit: 2, delay: "10 seconds" }, timeout: "5 minutes" },
+        async (): Promise<{ cache: CacheEvidence; stepEvidence: StepEvidence; config: RailConfig }> => {
           const t0 = Date.now();
-          const sbxId = `rail-${name}-${receiptId}-${Date.now().toString(36)}`;
+          const existing = await this.env.STORE.head(checkoutMeta.cacheKey);
+
+          if (existing && checkoutMeta.config) {
+            return {
+              config: checkoutMeta.config,
+              cache: {
+                hit: true,
+                key: checkoutMeta.cacheKey,
+                lockfileHash: checkoutMeta.lockfileHash,
+                durationMs: Date.now() - t0,
+                bytes: existing.size,
+              },
+              stepEvidence: {
+                name: "install",
+                command: "r2-cache-restore node_modules",
+                status: "pass",
+                exitCode: 0,
+                durationMs: Date.now() - t0,
+                stdout: `Cache HIT for lockfile ${checkoutMeta.lockfileHash} (${existing.size} bytes in R2: ${checkoutMeta.cacheKey}). Skipped install.`,
+                stderr: "",
+              },
+            };
+          }
+
+          const sbxId = `rail-install-${receiptId}-${Date.now().toString(36)}`;
           const sandbox = getSandbox(this.env.SANDBOX, sbxId, {
             transport: "rpc",
             enableDefaultSession: false,
@@ -261,58 +211,103 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
               env: { ARTIFACTS_REMOTE: checkoutMeta.remote, ARTIFACTS_TOKEN: tok.plaintext },
             });
             if (cloneRes.exitCode !== 0) {
+              const fallbackCfg = checkoutMeta.config ?? resolveRailConfig(null, null);
               return {
-                evidence: {
-                  name,
-                  command,
+                config: fallbackCfg,
+                cache: { hit: false, key: checkoutMeta.cacheKey, lockfileHash: checkoutMeta.lockfileHash, durationMs: Date.now() - t0, bytes: 0 },
+                stepEvidence: {
+                  name: "install",
+                  command: "git fetch && install",
                   status: "fail",
                   exitCode: cloneRes.exitCode,
                   durationMs: Date.now() - t0,
-                  parallelGroup: "checks",
                   stdout: trimLog(cloneRes.stdout),
                   stderr: trimLog(cloneRes.stderr),
                 },
               };
             }
 
-            // Restore cached node_modules from R2
-            const cached = await this.env.STORE.get(checkoutMeta.cacheKey);
-            if (cached) {
-              const buf = new Uint8Array(await cached.arrayBuffer());
-              await sandbox.writeFile("/tmp/node_modules.tar.gz", bytesToBase64(buf), { encoding: "base64" });
-              await sandbox.exec("tar -xzf /tmp/node_modules.tar.gz -C /workspace", { cwd: "/workspace" });
-            }
-
-            const res = await sandbox.exec(command, {
-              cwd: "/workspace",
-              timeout: 120_000,
-              env: { CI: "true", RAIL_COMMIT_SHA: after, RAIL_SHORT_SHA: shortSha },
-            });
-
-            let bundleKey: string | undefined;
-            let bundleBytes: number | undefined;
-            if (captureBundle && res.exitCode === 0) {
-              const built = await sandbox.readFile("/workspace/dist/worker.js", { encoding: "utf-8" });
-              bundleKey = `deployments/${after}/worker.js`;
-              const encoded = new TextEncoder().encode(built.content);
-              bundleBytes = encoded.byteLength;
-              await this.env.STORE.put(bundleKey, encoded, {
-                httpMetadata: { contentType: "application/javascript" },
-                customMetadata: { sha: after, receiptId },
+            // Read rail.json & package.json from workspace if config wasn't resolved yet
+            let config = checkoutMeta.config;
+            if (!config) {
+              const railRaw = await sandbox
+                .readFile("/workspace/rail.json", { encoding: "utf-8" })
+                .then((f) => f.content)
+                .catch(() => null);
+              const pkgRaw = await sandbox
+                .readFile("/workspace/package.json", { encoding: "utf-8" })
+                .then((f) => f.content)
+                .catch(() => null);
+              config = resolveRailConfig(railRaw, pkgRaw);
+              await this.env.STORE.put(checkoutMeta.configKey, JSON.stringify(config), {
+                httpMetadata: { contentType: "application/json" },
               });
             }
 
+            if (existing) {
+              return {
+                config,
+                cache: {
+                  hit: true,
+                  key: checkoutMeta.cacheKey,
+                  lockfileHash: checkoutMeta.lockfileHash,
+                  durationMs: Date.now() - t0,
+                  bytes: existing.size,
+                },
+                stepEvidence: {
+                  name: "install",
+                  command: "r2-cache-restore node_modules",
+                  status: "pass",
+                  exitCode: 0,
+                  durationMs: Date.now() - t0,
+                  stdout: `Cache HIT for lockfile ${checkoutMeta.lockfileHash} (${existing.size} bytes in R2). Resolved config from ${config.source}.`,
+                  stderr: "",
+                },
+              };
+            }
+
+            const res = await sandbox.exec(
+              `${config.install} && tar -czf /tmp/node_modules.tar.gz -C /workspace node_modules`,
+              { cwd: "/workspace", timeout: 180_000, env: { CI: "true" } }
+            );
+            if (res.exitCode !== 0) {
+              return {
+                config,
+                cache: { hit: false, key: checkoutMeta.cacheKey, lockfileHash: checkoutMeta.lockfileHash, durationMs: Date.now() - t0, bytes: 0 },
+                stepEvidence: {
+                  name: "install",
+                  command: config.install,
+                  status: "fail",
+                  exitCode: res.exitCode,
+                  durationMs: Date.now() - t0,
+                  stdout: trimLog(res.stdout),
+                  stderr: trimLog(res.stderr),
+                },
+              };
+            }
+
+            const tarFile = await sandbox.readFile("/tmp/node_modules.tar.gz", { encoding: "base64" });
+            const bytes = base64ToBytes(tarFile.content);
+            await this.env.STORE.put(checkoutMeta.cacheKey, bytes, {
+              customMetadata: { lockfileHash: checkoutMeta.lockfileHash, sha: after },
+            });
+
             return {
-              bundleKey,
-              bundleBytes,
-              evidence: {
-                name,
-                command,
-                status: res.exitCode === 0 ? "pass" : "fail",
-                exitCode: res.exitCode,
+              config,
+              cache: {
+                hit: false,
+                key: checkoutMeta.cacheKey,
+                lockfileHash: checkoutMeta.lockfileHash,
                 durationMs: Date.now() - t0,
-                parallelGroup: "checks",
-                stdout: trimLog(res.stdout),
+                bytes: bytes.byteLength,
+              },
+              stepEvidence: {
+                name: "install",
+                command: config.install,
+                status: "pass",
+                exitCode: 0,
+                durationMs: Date.now() - t0,
+                stdout: trimLog(res.stdout) + `\nCached node_modules (${bytes.byteLength} bytes) -> ${checkoutMeta.cacheKey}`,
                 stderr: trimLog(res.stderr),
               },
             };
@@ -322,180 +317,273 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
         }
       );
 
-    // 4. Parallel checks (only if install succeeded)
-    let bundleKey: string | undefined;
-    let bundleBytes: number | undefined;
+      const config = installOut.config;
+      const receiptWithCfg: Receipt = { ...baseReceipt, configSource: config.source };
+      const steps: StepEvidence[] = [installOut.stepEvidence];
 
-    if (installOut.stepEvidence.status === "pass") {
-      const [lintRes, typeRes, testRes, buildRes] = await Promise.all([
-        runParallelCheck("lint", "npm run lint"),
-        runParallelCheck("typecheck", "npm run typecheck"),
-        runParallelCheck("test", "npm run test"),
-        runParallelCheck("build", "npm run build", true),
-      ]);
-      steps.push(lintRes.evidence, typeRes.evidence, testRes.evidence, buildRes.evidence);
-      bundleKey = buildRes.bundleKey;
-      bundleBytes = buildRes.bundleBytes;
-    }
+      const runParallelCheck = (name: string, command: string, captureArtifactPath?: string) =>
+        step.do(
+          `check-${name}`,
+          { retries: { limit: 2, delay: "10 seconds" }, timeout: "4 minutes" },
+          async (): Promise<{ evidence: StepEvidence; bundleKey?: string; bundleBytes?: number }> => {
+            const t0 = Date.now();
+            const sbxId = `rail-${name}-${receiptId}-${Date.now().toString(36)}`;
+            const sandbox = getSandbox(this.env.SANDBOX, sbxId, {
+              transport: "rpc",
+              enableDefaultSession: false,
+              containerTimeouts: { portReadyTimeoutMS: 60_000 },
+            });
+            try {
+              const repo = await this.env.ARTIFACTS.get(repoName);
+              const tok = await repo.createToken("read", 600);
+              const cloneRes = await sandbox.exec(cloneCommand(after), {
+                cwd: "/",
+                timeout: 120_000,
+                env: { ARTIFACTS_REMOTE: checkoutMeta.remote, ARTIFACTS_TOKEN: tok.plaintext },
+              });
+              if (cloneRes.exitCode !== 0) {
+                return {
+                  evidence: {
+                    name,
+                    command,
+                    status: "fail",
+                    exitCode: cloneRes.exitCode,
+                    durationMs: Date.now() - t0,
+                    parallelGroup: "checks",
+                    stdout: trimLog(cloneRes.stdout),
+                    stderr: trimLog(cloneRes.stderr),
+                  },
+                };
+              }
 
-    const failedSteps = steps.filter((s) => s.status === "fail").map((s) => s.name);
+              const cached = await this.env.STORE.get(checkoutMeta.cacheKey);
+              if (cached) {
+                const buf = new Uint8Array(await cached.arrayBuffer());
+                await sandbox.writeFile("/tmp/node_modules.tar.gz", bytesToBase64(buf), { encoding: "base64" });
+                await sandbox.exec("tar -xzf /tmp/node_modules.tar.gz -C /workspace", { cwd: "/workspace" });
+              }
 
-    // 5. Fail-closed gate check on parallel runners
-    if (failedSteps.length > 0 || !bundleKey) {
-      const gate: GateEvidence = {
-        passed: false,
-        failClosed: true,
-        reason: failedSteps.length > 0 ? `check_failed: ${failedSteps.join(", ")}` : "missing_build_artifact",
-        failedSteps,
-      };
-      const finishedAt = new Date().toISOString();
-      const finalReceipt: Receipt = {
-        ...baseReceipt,
-        outcome: "FAIL",
-        timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
-        cache: installOut.cache,
-        steps,
-        gate,
-        deploy: { deployed: false },
-        nextActionHint: "fix_or_revert",
-      };
-      await step.do("emit-fail-receipt", async () => {
-        await railStub.saveReceipt(finalReceipt);
-        await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(finalReceipt, null, 2), {
-          httpMetadata: { contentType: "application/json" },
+              const res = await sandbox.exec(command, {
+                cwd: "/workspace",
+                timeout: 120_000,
+                env: { CI: "true", RAIL_COMMIT_SHA: after, RAIL_SHORT_SHA: shortSha },
+              });
+
+              let bundleKey: string | undefined;
+              let bundleBytes: number | undefined;
+              if (captureArtifactPath && res.exitCode === 0) {
+                const fullPath = captureArtifactPath.startsWith("/")
+                  ? captureArtifactPath
+                  : `/workspace/${captureArtifactPath}`;
+                const built = await sandbox.readFile(fullPath, { encoding: "utf-8" });
+                bundleKey = `deployments/${after}/worker.js`;
+                const encoded = new TextEncoder().encode(built.content);
+                bundleBytes = encoded.byteLength;
+                await this.env.STORE.put(bundleKey, encoded, {
+                  httpMetadata: { contentType: "application/javascript" },
+                  customMetadata: { sha: after, receiptId, artifact: captureArtifactPath },
+                });
+              }
+
+              return {
+                bundleKey,
+                bundleBytes,
+                evidence: {
+                  name,
+                  command,
+                  status: res.exitCode === 0 ? "pass" : "fail",
+                  exitCode: res.exitCode,
+                  durationMs: Date.now() - t0,
+                  parallelGroup: "checks",
+                  stdout: trimLog(res.stdout),
+                  stderr: trimLog(res.stderr),
+                },
+              };
+            } finally {
+              await sandbox.destroy().catch(() => {});
+            }
+          }
+        );
+
+      // 4. Parallel checks from rail.json or auto-detected package.json scripts
+      let bundleKey: string | undefined;
+      let bundleBytes: number | undefined;
+
+      if (installOut.stepEvidence.status === "pass") {
+        const checkResults = await Promise.all(
+          config.checks.map((chk) =>
+            runParallelCheck(chk.name, chk.command, chk.name === "build" ? config.artifact : undefined)
+          )
+        );
+        for (const r of checkResults) {
+          steps.push(r.evidence);
+          if (r.bundleKey) {
+            bundleKey = r.bundleKey;
+            bundleBytes = r.bundleBytes;
+          }
+        }
+      }
+
+      const failedSteps = steps.filter((s) => s.status === "fail").map((s) => s.name);
+
+      // 5. Fail-closed gate check on parallel runners
+      if (failedSteps.length > 0 || !bundleKey) {
+        const gate: GateEvidence = {
+          passed: false,
+          failClosed: true,
+          reason: failedSteps.length > 0 ? `check_failed: ${failedSteps.join(", ")}` : "missing_build_artifact",
+          failedSteps,
+        };
+        const finishedAt = new Date().toISOString();
+        const finalReceipt: Receipt = {
+          ...receiptWithCfg,
+          outcome: "FAIL",
+          timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+          cache: installOut.cache,
+          steps,
+          gate,
+          deploy: { deployed: false },
+          nextActionHint: "fix_or_revert",
+        };
+        await step.do("emit-fail-receipt", async () => {
+          await railStub.saveReceipt(finalReceipt);
+          await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(finalReceipt, null, 2), {
+            httpMetadata: { contentType: "application/json" },
+          });
         });
-      });
-      return { receiptId, outcome: "FAIL" };
-    }
+        return { receiptId, outcome: "FAIL" };
+      }
 
-    // 6. Keel-style promotion gate: boot candidate bundle in a network-isolated Worker Loader isolate & probe /health + /
-    const preview: PreviewProbeEvidence = await step.do("preview-gate", async () => {
-      const t0 = Date.now();
-      const isolateId = `preview-${shortSha}-${receiptId}`;
-      try {
-        const obj = await this.env.STORE.get(bundleKey!);
-        if (!obj) {
+      // 6. Keel-style preview gate in a network-isolated Worker Loader isolate
+      const preview: PreviewProbeEvidence = await step.do("preview-gate", async () => {
+        const t0 = Date.now();
+        const isolateId = `preview-${shortSha}-${receiptId}`;
+        try {
+          const obj = await this.env.STORE.get(bundleKey!);
+          if (!obj) {
+            return {
+              executed: true,
+              passed: false,
+              isolateId,
+              globalOutbound: "disabled",
+              durationMs: Date.now() - t0,
+              error: `bundle not found in R2: ${bundleKey}`,
+            };
+          }
+          const code = await obj.text();
+          const stub = this.env.LOADER.get(isolateId, async () => ({
+            compatibilityDate: "2026-06-16",
+            mainModule: "worker.js",
+            modules: { "worker.js": code },
+            globalOutbound: null,
+          }));
+          const entry = stub.getEntrypoint();
+          const healthRes = await entry.fetch(new Request(`https://preview.rail.internal${config.preview.healthPath}`));
+          const healthBody = await healthRes.text();
+          let healthOk = false;
+          try {
+            const parsed = JSON.parse(healthBody) as { ok?: boolean };
+            healthOk = healthRes.status === 200 && parsed.ok === true;
+          } catch {
+            healthOk = false;
+          }
+          const rootRes = await entry.fetch(new Request(`https://preview.rail.internal${config.preview.rootPath}`));
+          const passed = healthOk && rootRes.status === 200;
+          return {
+            executed: true,
+            passed,
+            isolateId,
+            globalOutbound: "disabled",
+            healthStatus: healthRes.status,
+            healthBody: trimLog(healthBody),
+            rootStatus: rootRes.status,
+            durationMs: Date.now() - t0,
+            error: passed
+              ? undefined
+              : `probe failed: ${config.preview.healthPath}=${healthRes.status} ${config.preview.rootPath}=${rootRes.status}`,
+          };
+        } catch (err) {
           return {
             executed: true,
             passed: false,
             isolateId,
             globalOutbound: "disabled",
             durationMs: Date.now() - t0,
-            error: `bundle not found in R2: ${bundleKey}`,
+            error: String(err instanceof Error ? err.message : err),
           };
         }
-        const code = await obj.text();
-        const stub = this.env.LOADER.get(isolateId, async () => ({
-          compatibilityDate: "2026-06-16",
-          mainModule: "worker.js",
-          modules: { "worker.js": code },
-          globalOutbound: null,
-        }));
-        const entry = stub.getEntrypoint();
-        const healthRes = await entry.fetch(new Request("https://preview.rail.internal/health"));
-        const healthBody = await healthRes.text();
-        let healthOk = false;
-        try {
-          const parsed = JSON.parse(healthBody) as { ok?: boolean };
-          healthOk = healthRes.status === 200 && parsed.ok === true;
-        } catch {
-          healthOk = false;
-        }
-        const rootRes = await entry.fetch(new Request("https://preview.rail.internal/"));
-        const passed = healthOk && rootRes.status === 200;
-        return {
-          executed: true,
-          passed,
-          isolateId,
-          globalOutbound: "disabled",
-          healthStatus: healthRes.status,
-          healthBody: trimLog(healthBody),
-          rootStatus: rootRes.status,
-          durationMs: Date.now() - t0,
-          error: passed ? undefined : `probe failed: /health=${healthRes.status} /=${rootRes.status}`,
-        };
-      } catch (err) {
-        return {
-          executed: true,
-          passed: false,
-          isolateId,
-          globalOutbound: "disabled",
-          durationMs: Date.now() - t0,
-          error: String(err instanceof Error ? err.message : err),
-        };
-      }
-    });
+      });
 
-    if (!preview.passed) {
-      const gate: GateEvidence = {
-        passed: false,
-        failClosed: true,
-        reason: preview.error || "preview_health_failed",
-        failedSteps: ["preview-gate"],
-        preview,
-      };
-      const finishedAt = new Date().toISOString();
-      const finalReceipt: Receipt = {
-        ...baseReceipt,
-        outcome: "FAIL",
-        timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
-        cache: installOut.cache,
-        steps,
-        gate,
-        deploy: { deployed: false, bundleKey, bundleBytes, previewUrl: `${origin}/preview/${after}` },
-        nextActionHint: "fix_or_revert",
-      };
-      await step.do("emit-preview-fail-receipt", async () => {
-        await railStub.saveReceipt(finalReceipt);
-        await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(finalReceipt, null, 2), {
+      if (!preview.passed) {
+        const gate: GateEvidence = {
+          passed: false,
+          failClosed: true,
+          reason: preview.error || "preview_health_failed",
+          failedSteps: ["preview-gate"],
+          preview,
+        };
+        const finishedAt = new Date().toISOString();
+        const finalReceipt: Receipt = {
+          ...receiptWithCfg,
+          outcome: "FAIL",
+          timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+          cache: installOut.cache,
+          steps,
+          gate,
+          deploy: { deployed: false, bundleKey, bundleBytes, previewUrl: `${origin}/preview/${after}` },
+          nextActionHint: "fix_or_revert",
+        };
+        await step.do("emit-preview-fail-receipt", async () => {
+          await railStub.saveReceipt(finalReceipt);
+          await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(finalReceipt, null, 2), {
+            httpMetadata: { contentType: "application/json" },
+          });
+        });
+        return { receiptId, outcome: "FAIL" };
+      }
+
+      // 7. All gates green -> atomically promote in Durable Object & emit PASS receipt
+      const finalReceipt = await step.do("promote-and-emit-receipt", async () => {
+        const prod = await railStub.promote({
+          sha: after,
+          receiptId,
+          bundleKey: bundleKey!,
+          commitMessage,
+          author,
+        });
+        const finishedAt = new Date().toISOString();
+        const receipt: Receipt = {
+          ...receiptWithCfg,
+          outcome: "PASS",
+          timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+          cache: installOut.cache,
+          steps,
+          gate: {
+            passed: true,
+            failClosed: true,
+            reason: "all_checks_and_preview_passed",
+            failedSteps: [],
+            preview,
+          },
+          deploy: {
+            deployed: true,
+            deployId: prod.deployId,
+            bundleKey,
+            bundleBytes,
+            liveUrl: `${origin}/app`,
+            previewUrl: `${origin}/preview/${after}`,
+            promotedAt: prod.promotedAt,
+          },
+          nextActionHint: "continue",
+        };
+        await railStub.saveReceipt(receipt);
+        await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(receipt, null, 2), {
           httpMetadata: { contentType: "application/json" },
         });
+        return receipt;
       });
-      return { receiptId, outcome: "FAIL" };
-    }
 
-    // 7. All gates green -> atomically promote in Durable Object & emit PASS receipt
-    const finalReceipt = await step.do("promote-and-emit-receipt", async () => {
-      const prod = await railStub.promote({
-        sha: after,
-        receiptId,
-        bundleKey: bundleKey!,
-        commitMessage,
-        author,
-      });
-      const finishedAt = new Date().toISOString();
-      const receipt: Receipt = {
-        ...baseReceipt,
-        outcome: "PASS",
-        timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
-        cache: installOut.cache,
-        steps,
-        gate: {
-          passed: true,
-          failClosed: true,
-          reason: "all_checks_and_preview_passed",
-          failedSteps: [],
-          preview,
-        },
-        deploy: {
-          deployed: true,
-          deployId: prod.deployId,
-          bundleKey,
-          bundleBytes,
-          liveUrl: `${origin}/app`,
-          previewUrl: `${origin}/preview/${after}`,
-          promotedAt: prod.promotedAt,
-        },
-        nextActionHint: "continue",
-      };
-      await railStub.saveReceipt(receipt);
-      await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(receipt, null, 2), {
-        httpMetadata: { contentType: "application/json" },
-      });
-      return receipt;
-    });
-
-    return { receiptId: finalReceipt.id, outcome: "PASS" };
+      return { receiptId: finalReceipt.id, outcome: "PASS" };
     } catch (err) {
       const finishedAt = new Date().toISOString();
       const errReceipt: Receipt = {

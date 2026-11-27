@@ -1,0 +1,13 @@
+{
+  "branch": "main",
+  "install": "npm ci --no-audit --no-fund",
+  "lockfiles": ["package.json", "package-lock.json"],
+  "checks": {
+    "lint": "npm run lint",
+    "typecheck": "npm run typecheck",
+    "test": "npm run test",
+    "build": "npm run build"
+  },
+  "artifact": "dist/worker.js",
+  "preview": { "healthPath": "/health", "rootPath": "/" }
+}

@@ -133,19 +133,60 @@ export function renderHome(
     </div>
   </section>
 
+  <section class="card">
+    <h2>Use rail in your new or existing app (3 steps)</h2>
+    <div class="grid2">
+      <div>
+        <p class="sub" style="margin:0 0 .5rem;font-size:.84rem">
+          <strong>1. Wire your repo &amp; deploy the control plane</strong> (provisions R2, Artifacts repo, and <code>wrangler.jsonc</code>):
+        </p>
+        <pre class="cmd">git clone https://github.com/acoyfellow/rail &amp;&amp; cd rail &amp;&amp; bun install
+bun run init -- \
+  --account &lt;CF_ACCOUNT_ID&gt; \
+  --namespace &lt;NS&gt; \
+  --repo &lt;APP_NAME&gt; \
+  --app-dir ../my-existing-app
+wrangler deploy</pre>
+        <p class="sub" style="margin:.6rem 0 .4rem;font-size:.84rem">
+          <strong>3. Push your existing repo</strong> (rollback is just another push):
+        </p>
+        <pre class="cmd">cd ../my-existing-app
+git remote add cf https://&lt;ACCOUNT_ID&gt;.artifacts.cloudflare.net/git/&lt;NS&gt;/&lt;APP_NAME&gt;.git
+git push cf main</pre>
+      </div>
+      <div>
+        <p class="sub" style="margin:0 0 .5rem;font-size:.84rem">
+          <strong>2. Optional <code>rail.json</code> in your app root</strong> (zero-config auto-detects <code>package.json</code> scripts if omitted):
+        </p>
+        <pre class="cmd">{
+  "branch": "main",
+  "install": "npm ci --no-audit --no-fund",
+  "checks": {
+    "lint": "npm run lint",
+    "typecheck": "npm run typecheck",
+    "test": "npm run test",
+    "build": "npm run build"
+  },
+  "artifact": "dist/worker.js",
+  "preview": { "healthPath": "/health", "rootPath": "/" }
+}</pre>
+      </div>
+    </div>
+  </section>
+
   <div class="grid2">
     <section class="card">
       <h2>Live Production Worker (/app)</h2>
       ${prodCard}
     </section>
     <section class="card">
-      <h2>Artifacts Remote &amp; Agent Surface</h2>
+      <h2>Live Demo Remote &amp; Agent MCP</h2>
       <pre class="cmd">git remote add cf https://${esc(repoInfo.accountId)}.artifacts.cloudflare.net/git/${esc(repoInfo.namespace)}/${esc(repoInfo.repo)}.git
 git push cf main</pre>
       <p class="sub" style="margin-top:.65rem;font-size:.82rem">
         Agent MCP endpoint: <a href="/mcp"><code>/mcp</code></a> (<code>repo.status</code>, <code>repo.receipts</code>, <code>repo.receipt</code>) ·
         <a href="/llms.txt"><code>/llms.txt</code></a> ·
-        Rollback = push a known-good commit.
+        <a href="https://github.com/acoyfellow/rail#readme">full adoption guide ↗</a>
       </p>
     </section>
   </div>
@@ -227,6 +268,7 @@ export function renderReceipt(r: Receipt): Response {
     <section class="card">
       <h2>Gate, Cache &amp; Deploy</h2>
       <dl class="kv">
+        <dt>config</dt><dd class="mono">${esc(r.configSource ?? "default")}</dd>
         <dt>cache</dt><dd class="mono">${r.cache ? `${r.cache.hit ? "HIT" : "MISS"} · lockfile ${esc(r.cache.lockfileHash)} · ${r.cache.bytes} B · ${fmtMs(r.cache.durationMs)}` : "—"}</dd>
         <dt>gate</dt><dd class="mono">${r.gate ? `${r.gate.passed ? "PASSED" : "FAILED CLOSED"} (${esc(r.gate.reason)})` : "pending"}</dd>
         <dt>deployed</dt><dd class="mono">${r.deploy.deployed ? `YES · ${esc(r.deploy.deployId)} · <a href="/app">/app ↗</a>` : "NO (production unchanged)"}</dd>
