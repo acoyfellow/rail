@@ -2,6 +2,8 @@ export interface RailDeployConfig {
   mode: "worker-loader" | "command";
   /** Required when mode === "command", e.g. "npm run deploy:forge-tools && npm run deploy" */
   command?: string;
+  /** Optional command to deploy per-PR previews on non-main branches (receives RAIL_BRANCH & RAIL_PR_NUMBER) */
+  prCommand?: string;
   /** Optional post-deploy HTTP probe URL (must return 200), e.g. "https://staging.example.com/health" */
   verifyUrl?: string;
 }
@@ -33,6 +35,7 @@ export interface RailJsonInput {
   deploy?: {
     mode?: "worker-loader" | "command";
     command?: string;
+    prCommand?: string;
     verifyUrl?: string;
   };
 }
@@ -79,6 +82,7 @@ export function resolveRailConfig(
       deploy: {
         mode,
         command: parsed.deploy?.command?.trim() || undefined,
+        prCommand: parsed.deploy?.prCommand?.trim() || undefined,
         verifyUrl: parsed.deploy?.verifyUrl?.trim() || undefined,
       },
       source: "rail.json",

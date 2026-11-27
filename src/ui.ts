@@ -190,16 +190,21 @@ export function renderHome(
           const cachePill = r.cache
             ? `<span class="pill ${r.cache.hit ? "pass" : ""}">cache ${r.cache.hit ? "HIT" : "MISS"}</span>`
             : "";
+          const branchPill = r.repo.branch !== "main"
+            ? `<span class="pill brand">${esc(r.repo.branch)}</span>`
+            : "";
           const deployPill = r.deploy.deployed
             ? `<span class="pill">${esc(r.deploy.deployId)}</span>`
-            : `<span class="pill fail">deploy refused</span>`;
+            : r.outcome === "PASS"
+              ? `<span class="pill">pr check only</span>`
+              : `<span class="pill fail">deploy refused</span>`;
           return `<div class="feed-row">
             <div>${outcomePill(r.outcome)}</div>
             <div class="feed-msg">
               <div class="feed-title">${esc(r.commit.message.split("\n")[0])}</div>
               <div class="feed-sub">${esc(r.commit.shortSha)} · ${esc(r.commit.author)}${r.configSource ? ` · ${esc(r.configSource)}` : ""}</div>
             </div>
-            <div class="feed-meta" style="display:flex;gap:.4rem;flex-wrap:wrap">${cachePill}${deployPill}</div>
+            <div class="feed-meta" style="display:flex;gap:.4rem;flex-wrap:wrap">${branchPill}${cachePill}${deployPill}</div>
             <div class="feed-time mono" style="color:var(--mut)">${fmtMs(r.timings.totalMs)}</div>
             <div class="feed-links">
               <a href="/receipt/${esc(r.id)}">receipt</a>

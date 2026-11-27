@@ -3,7 +3,7 @@ import { handleMcp } from "./mcp";
 import { RailDO } from "./rail-do";
 import type { Env } from "./types";
 import { renderHome, renderReceipt } from "./ui";
-import { mirrorGithubPushToArtifacts, verifyGithubSignature, type GithubPushPayload } from "./github";
+import { mirrorGithubPrToArtifacts, mirrorGithubPushToArtifacts, verifyGithubSignature, type GithubPullRequestPayload, type GithubPushPayload } from "./github";
 import { RailWorkflow } from "./workflow";
 
 export { CiSandbox, RailDO, RailWorkflow };
@@ -80,6 +80,15 @@ export default {
       const eventType = request.headers.get("x-github-event") || "";
       if (eventType === "ping") {
         return Response.json({ ok: true, pong: true });
+      }
+      if (eventType === "pull_request") {
+        const prPayload = JSON.parse(rawBody) as GithubPullRequestPayload;
+        if (!["opened", "synchronize", "reopened"].includes(prPayload.action || "")) {
+          return Response.json({ ok: true, ignored: true, reason: `pr_action:${prPayload.action}` });
+        }
+        const targetRepo = url.searchParams.get("repo") || env.ARTIFACTS_REPO || prPayload.repository?.name || "demo-app";
+        const result = await mirrorGithubPrToArtifacts(env, prPayload, targetRepo);
+        return Response.json(result, { status: result.ok ? 202 : 500 });
       }
       if (eventType !== "push") {
         return Response.json({ ok: true, ignored: true, reason: `event:${eventType}` });

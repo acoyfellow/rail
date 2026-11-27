@@ -67,9 +67,8 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
       return { receiptId: "ignored", outcome: "IGNORED" };
     }
     const branch = ref.slice("refs/heads/".length);
-    if (branch !== "main") {
-      return { receiptId: "ignored", outcome: "IGNORED_NON_MAIN" };
-    }
+    const prMatch = /^pr-(\d+)$/.exec(branch);
+    const prNumber = prMatch ? prMatch[1] : undefined;
 
     const startedAt = new Date().toISOString();
     const startWall = Date.now();
@@ -79,7 +78,7 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
     const commitMessage = lastCommit?.message?.trim() || "(no commit message)";
     const author = lastCommit?.author?.name || "unknown";
     const origin = this.env.PUBLIC_ORIGIN || "https://rail.customer0.dev";
-    const railStub = this.env.RAIL.get(this.env.RAIL.idFromName(`${namespace}/${repoName}/${branch}`));
+    const railStub = this.env.RAIL.get(this.env.RAIL.idFromName(`${namespace}/${repoName}/main`));
 
     const baseReceipt: Receipt = {
       id: receiptId,
@@ -367,7 +366,7 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
               const res = await sandbox.exec(command, {
                 cwd: "/workspace",
                 timeout: 120_000,
-                env: { CI: "true", RAIL_COMMIT_SHA: after, RAIL_SHORT_SHA: shortSha },
+                env: { CI: "true", RAIL_COMMIT_SHA: after, RAIL_SHORT_SHA: shortSha, RAIL_BRANCH: branch, ...(prNumber ? { RAIL_PR_NUMBER: prNumber } : {}) },
               });
 
               let bundleKey: string | undefined;
@@ -456,9 +455,36 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
         return { receiptId, outcome: "FAIL" };
       }
 
+      const isDeployBranch = branch === config.branch;
+
       // 5b. Command deploy mode (for multi-binding staging Workers, e.g. wrangler deploy --env staging)
       if (config.deploy.mode === "command") {
-        const deployCmd = config.deploy.command;
+        const deployCmd = isDeployBranch ? config.deploy.command : config.deploy.prCommand;
+        if (!isDeployBranch && !deployCmd) {
+          const finishedAt = new Date().toISOString();
+          const prPassReceipt: Receipt = {
+            ...receiptWithCfg,
+            outcome: "PASS",
+            timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+            cache: installOut.cache,
+            steps,
+            gate: {
+              passed: true,
+              failClosed: true,
+              reason: "pr_checks_passed_no_promote",
+              failedSteps: [],
+            },
+            deploy: { deployed: false, mode: "command" },
+            nextActionHint: "continue",
+          };
+          await step.do("emit-pr-check-only-pass", async () => {
+            await railStub.saveReceipt(prPassReceipt);
+            await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(prPassReceipt, null, 2), {
+              httpMetadata: { contentType: "application/json" },
+            });
+          });
+          return { receiptId, outcome: "PASS" };
+        }
         if (!deployCmd) {
           const finishedAt = new Date().toISOString();
           const failReceipt: Receipt = {
@@ -523,6 +549,8 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
                   CI: "true",
                   RAIL_COMMIT_SHA: after,
                   RAIL_SHORT_SHA: shortSha,
+                  RAIL_BRANCH: branch,
+                  ...(prNumber ? { RAIL_PR_NUMBER: prNumber } : {}),
                   CLOUDFLARE_ACCOUNT_ID: this.env.CLOUDFLARE_ACCOUNT_ID,
                   ...(this.env.DEPLOY_API_TOKEN ? { CLOUDFLARE_API_TOKEN: this.env.DEPLOY_API_TOKEN } : {}),
                 },
@@ -605,14 +633,16 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
         }
 
         const cmdReceipt = await step.do("record-command-deploy-pass", async () => {
-          const prod = await railStub.promote({
-            sha: after,
-            receiptId,
-            bundleKey: `command:${deployCmd}`,
-            commitMessage,
-            author,
-          });
           const finishedAt = new Date().toISOString();
+          const prod = isDeployBranch
+            ? await railStub.promote({
+                sha: after,
+                receiptId,
+                bundleKey: `command:${deployCmd}`,
+                commitMessage,
+                author,
+              })
+            : null;
           const receipt: Receipt = {
             ...receiptWithCfg,
             outcome: "PASS",
@@ -622,16 +652,20 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
             gate: {
               passed: true,
               failClosed: true,
-              reason: verifyProbe ? "checks_deploy_and_verify_passed" : "checks_and_deploy_passed",
+              reason: !isDeployBranch
+                ? "pr_preview_deploy_passed"
+                : verifyProbe
+                  ? "checks_deploy_and_verify_passed"
+                  : "checks_and_deploy_passed",
               failedSteps: [],
               preview: verifyProbe,
             },
             deploy: {
               deployed: true,
               mode: "command",
-              deployId: prod.deployId,
+              deployId: prod ? prod.deployId : `pr_${shortSha}`,
               liveUrl: config.deploy.verifyUrl || `${origin}/app`,
-              promotedAt: prod.promotedAt,
+              promotedAt: prod ? prod.promotedAt : finishedAt,
             },
             nextActionHint: "continue",
           };
@@ -732,16 +766,18 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
         return { receiptId, outcome: "FAIL" };
       }
 
-      // 7. All gates green -> atomically promote in Durable Object & emit PASS receipt
+      // 7. All gates green -> promote in Durable Object on deploy branch, or keep preview-only on PR branches
       const finalReceipt = await step.do("promote-and-emit-receipt", async () => {
-        const prod = await railStub.promote({
-          sha: after,
-          receiptId,
-          bundleKey: bundleKey!,
-          commitMessage,
-          author,
-        });
         const finishedAt = new Date().toISOString();
+        const prod = isDeployBranch
+          ? await railStub.promote({
+              sha: after,
+              receiptId,
+              bundleKey: bundleKey!,
+              commitMessage,
+              author,
+            })
+          : null;
         const receipt: Receipt = {
           ...receiptWithCfg,
           outcome: "PASS",
@@ -751,18 +787,19 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
           gate: {
             passed: true,
             failClosed: true,
-            reason: "all_checks_and_preview_passed",
+            reason: isDeployBranch ? "all_checks_and_preview_passed" : "pr_checks_and_preview_passed_no_promote",
             failedSteps: [],
             preview,
           },
           deploy: {
-            deployed: true,
-            deployId: prod.deployId,
+            deployed: Boolean(prod),
+            mode: "worker-loader",
+            deployId: prod?.deployId,
             bundleKey,
             bundleBytes,
-            liveUrl: `${origin}/app`,
+            liveUrl: prod ? `${origin}/app` : undefined,
             previewUrl: `${origin}/preview/${after}`,
-            promotedAt: prod.promotedAt,
+            promotedAt: prod?.promotedAt,
           },
           nextActionHint: "continue",
         };
