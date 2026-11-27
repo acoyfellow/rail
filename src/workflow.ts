@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
 import { resolveRailConfig, type RailConfig } from "./config";
+import { scrubSecrets } from "./github";
 import type {
   ArtifactsPushEvent,
   CacheEvidence,
@@ -412,7 +413,7 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
       if (installOut.stepEvidence.status === "pass") {
         const checkResults = await Promise.all(
           config.checks.map((chk) =>
-            runParallelCheck(chk.name, chk.command, chk.name === "build" ? config.artifact : undefined)
+            runParallelCheck(chk.name, chk.command, config.deploy.mode === "worker-loader" && chk.name === "build" ? config.artifact : undefined)
           )
         );
         for (const r of checkResults) {
@@ -427,7 +428,8 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
       const failedSteps = steps.filter((s) => s.status === "fail").map((s) => s.name);
 
       // 5. Fail-closed gate check on parallel runners
-      if (failedSteps.length > 0 || !bundleKey) {
+      const needsBundle = config.deploy.mode === "worker-loader";
+      if (failedSteps.length > 0 || (needsBundle && !bundleKey)) {
         const gate: GateEvidence = {
           passed: false,
           failClosed: true,
@@ -452,6 +454,194 @@ export class RailWorkflow extends WorkflowEntrypoint<Env, ArtifactsPushEvent> {
           });
         });
         return { receiptId, outcome: "FAIL" };
+      }
+
+      // 5b. Command deploy mode (for multi-binding staging Workers, e.g. wrangler deploy --env staging)
+      if (config.deploy.mode === "command") {
+        const deployCmd = config.deploy.command;
+        if (!deployCmd) {
+          const finishedAt = new Date().toISOString();
+          const failReceipt: Receipt = {
+            ...receiptWithCfg,
+            outcome: "FAIL",
+            timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+            cache: installOut.cache,
+            steps,
+            gate: { passed: false, failClosed: true, reason: "missing_deploy_command", failedSteps: ["deploy"] },
+            deploy: { deployed: false, mode: "command" },
+            nextActionHint: "fix_or_revert",
+          };
+          await step.do("emit-missing-cmd-fail", async () => {
+            await railStub.saveReceipt(failReceipt);
+            await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(failReceipt, null, 2), {
+              httpMetadata: { contentType: "application/json" },
+            });
+          });
+          return { receiptId, outcome: "FAIL" };
+        }
+
+        const deployStep: StepEvidence = await step.do(
+          "deploy-command",
+          { retries: { limit: 1, delay: "10 seconds" }, timeout: "5 minutes" },
+          async (): Promise<StepEvidence> => {
+            const t0 = Date.now();
+            const sbxId = `rail-deploy-${receiptId}-${Date.now().toString(36)}`;
+            const sandbox = getSandbox(this.env.SANDBOX, sbxId, {
+              transport: "rpc",
+              enableDefaultSession: false,
+              containerTimeouts: { portReadyTimeoutMS: 60_000 },
+            });
+            try {
+              const repo = await this.env.ARTIFACTS.get(repoName);
+              const tok = await repo.createToken("read", 600);
+              const cloneRes = await sandbox.exec(cloneCommand(after), {
+                cwd: "/",
+                timeout: 120_000,
+                env: { ARTIFACTS_REMOTE: checkoutMeta.remote, ARTIFACTS_TOKEN: tok.plaintext },
+              });
+              if (cloneRes.exitCode !== 0) {
+                return {
+                  name: "deploy",
+                  command: deployCmd,
+                  status: "fail",
+                  exitCode: cloneRes.exitCode,
+                  durationMs: Date.now() - t0,
+                  stdout: trimLog(scrubSecrets(cloneRes.stdout, [tok.plaintext, this.env.DEPLOY_API_TOKEN])),
+                  stderr: trimLog(scrubSecrets(cloneRes.stderr, [tok.plaintext, this.env.DEPLOY_API_TOKEN])),
+                };
+              }
+              const cached = await this.env.STORE.get(checkoutMeta.cacheKey);
+              if (cached) {
+                const buf = new Uint8Array(await cached.arrayBuffer());
+                await sandbox.writeFile("/tmp/node_modules.tar.gz", bytesToBase64(buf), { encoding: "base64" });
+                await sandbox.exec("tar -xzf /tmp/node_modules.tar.gz -C /workspace", { cwd: "/workspace" });
+              }
+              const res = await sandbox.exec(deployCmd, {
+                cwd: "/workspace",
+                timeout: 180_000,
+                env: {
+                  CI: "true",
+                  RAIL_COMMIT_SHA: after,
+                  RAIL_SHORT_SHA: shortSha,
+                  CLOUDFLARE_ACCOUNT_ID: this.env.CLOUDFLARE_ACCOUNT_ID,
+                  ...(this.env.DEPLOY_API_TOKEN ? { CLOUDFLARE_API_TOKEN: this.env.DEPLOY_API_TOKEN } : {}),
+                },
+              });
+              return {
+                name: "deploy",
+                command: deployCmd,
+                status: res.exitCode === 0 ? "pass" : "fail",
+                exitCode: res.exitCode,
+                durationMs: Date.now() - t0,
+                stdout: trimLog(scrubSecrets(res.stdout, [tok.plaintext, this.env.DEPLOY_API_TOKEN])),
+                stderr: trimLog(scrubSecrets(res.stderr, [tok.plaintext, this.env.DEPLOY_API_TOKEN])),
+              };
+            } finally {
+              await sandbox.destroy().catch(() => {});
+            }
+          }
+        );
+
+        steps.push(deployStep);
+
+        let verifyOk = true;
+        let verifyProbe: PreviewProbeEvidence | undefined;
+        if (deployStep.status === "pass" && config.deploy.verifyUrl) {
+          verifyProbe = await step.do("verify-staging-url", async (): Promise<PreviewProbeEvidence> => {
+            const t0 = Date.now();
+            try {
+              const res = await fetch(config.deploy.verifyUrl!);
+              const body = await res.text();
+              const passed = res.status === 200;
+              return {
+                executed: true,
+                passed,
+                isolateId: `staging-probe-${shortSha}`,
+                globalOutbound: "disabled",
+                healthStatus: res.status,
+                healthBody: trimLog(body),
+                durationMs: Date.now() - t0,
+                error: passed ? undefined : `verifyUrl returned HTTP ${res.status}`,
+              };
+            } catch (err) {
+              return {
+                executed: true,
+                passed: false,
+                isolateId: `staging-probe-${shortSha}`,
+                globalOutbound: "disabled",
+                durationMs: Date.now() - t0,
+                error: String(err instanceof Error ? err.message : err),
+              };
+            }
+          });
+          verifyOk = verifyProbe.passed;
+        }
+
+        if (deployStep.status !== "pass" || !verifyOk) {
+          const finishedAt = new Date().toISOString();
+          const failReceipt: Receipt = {
+            ...receiptWithCfg,
+            outcome: "FAIL",
+            timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+            cache: installOut.cache,
+            steps,
+            gate: {
+              passed: false,
+              failClosed: true,
+              reason: deployStep.status !== "pass" ? `deploy_failed (exit ${deployStep.exitCode})` : (verifyProbe?.error || "verify_url_failed"),
+              failedSteps: [deployStep.status !== "pass" ? "deploy" : "verify-url"],
+              preview: verifyProbe,
+            },
+            deploy: { deployed: false, mode: "command", liveUrl: config.deploy.verifyUrl },
+            nextActionHint: "fix_or_revert",
+          };
+          await step.do("emit-command-deploy-fail", async () => {
+            await railStub.saveReceipt(failReceipt);
+            await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(failReceipt, null, 2), {
+              httpMetadata: { contentType: "application/json" },
+            });
+          });
+          return { receiptId, outcome: "FAIL" };
+        }
+
+        const cmdReceipt = await step.do("record-command-deploy-pass", async () => {
+          const prod = await railStub.promote({
+            sha: after,
+            receiptId,
+            bundleKey: `command:${deployCmd}`,
+            commitMessage,
+            author,
+          });
+          const finishedAt = new Date().toISOString();
+          const receipt: Receipt = {
+            ...receiptWithCfg,
+            outcome: "PASS",
+            timings: { startedAt, finishedAt, totalMs: Date.now() - startWall },
+            cache: installOut.cache,
+            steps,
+            gate: {
+              passed: true,
+              failClosed: true,
+              reason: verifyProbe ? "checks_deploy_and_verify_passed" : "checks_and_deploy_passed",
+              failedSteps: [],
+              preview: verifyProbe,
+            },
+            deploy: {
+              deployed: true,
+              mode: "command",
+              deployId: prod.deployId,
+              liveUrl: config.deploy.verifyUrl || `${origin}/app`,
+              promotedAt: prod.promotedAt,
+            },
+            nextActionHint: "continue",
+          };
+          await railStub.saveReceipt(receipt);
+          await this.env.STORE.put(`receipts/${receiptId}.json`, JSON.stringify(receipt, null, 2), {
+            httpMetadata: { contentType: "application/json" },
+          });
+          return receipt;
+        });
+        return { receiptId: cmdReceipt.id, outcome: "PASS" };
       }
 
       // 6. Keel-style preview gate in a network-isolated Worker Loader isolate

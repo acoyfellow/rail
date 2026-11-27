@@ -3,6 +3,7 @@ import { handleMcp } from "./mcp";
 import { RailDO } from "./rail-do";
 import type { Env } from "./types";
 import { renderHome, renderReceipt } from "./ui";
+import { mirrorGithubPushToArtifacts, verifyGithubSignature, type GithubPushPayload } from "./github";
 import { RailWorkflow } from "./workflow";
 
 export { CiSandbox, RailDO, RailWorkflow };
@@ -53,7 +54,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
-    const railStub = env.RAIL.get(env.RAIL.idFromName(`${env.ARTIFACTS_NAMESPACE}/${env.ARTIFACTS_REPO}/main`));
+    const activeRepo = url.searchParams.get("repo") || env.ARTIFACTS_REPO;
+    const railStub = env.RAIL.get(env.RAIL.idFromName(`${env.ARTIFACTS_NAMESPACE}/${activeRepo}/main`));
 
     if (path === "/health") {
       return Response.json({ ok: true, service: "rail" });
@@ -61,6 +63,36 @@ export default {
 
     if (path === "/llms.txt") {
       return new Response(llmsTxt(env), { headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+
+
+    // Verified GitHub webhook -> mirrors commit into Cloudflare Artifacts (fires cf.artifacts.repo.pushed)
+    if (path === "/webhooks/github" && request.method === "POST") {
+      if (!env.GITHUB_WEBHOOK_SECRET) {
+        return Response.json({ ok: false, error: "GITHUB_WEBHOOK_SECRET is not configured" }, { status: 501 });
+      }
+      const rawBody = await request.text();
+      const sig = request.headers.get("x-hub-signature-256");
+      const valid = await verifyGithubSignature(env.GITHUB_WEBHOOK_SECRET, rawBody, sig);
+      if (!valid) {
+        return Response.json({ ok: false, error: "invalid_signature" }, { status: 401 });
+      }
+      const eventType = request.headers.get("x-github-event") || "";
+      if (eventType === "ping") {
+        return Response.json({ ok: true, pong: true });
+      }
+      if (eventType !== "push") {
+        return Response.json({ ok: true, ignored: true, reason: `event:${eventType}` });
+      }
+      const payload = JSON.parse(rawBody) as GithubPushPayload;
+      const ref = payload.ref || "";
+      if (!ref.startsWith("refs/heads/")) {
+        return Response.json({ ok: true, ignored: true, reason: "non_branch_ref" });
+      }
+      const branch = ref.slice("refs/heads/".length);
+      const targetRepo = url.searchParams.get("repo") || env.ARTIFACTS_REPO || payload.repository?.name || "demo-app";
+      const result = await mirrorGithubPushToArtifacts(env, payload, targetRepo, branch);
+      return Response.json(result, { status: result.ok ? 202 : 500 });
     }
 
     if (path === "/mcp") {
@@ -71,7 +103,7 @@ export default {
       const [production, receipts] = await Promise.all([railStub.getProduction(), railStub.listReceipts(25)]);
       return renderHome(production, receipts, {
         namespace: env.ARTIFACTS_NAMESPACE,
-        repo: env.ARTIFACTS_REPO,
+        repo: activeRepo,
         accountId: env.CLOUDFLARE_ACCOUNT_ID,
       });
     }

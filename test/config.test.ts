@@ -30,4 +30,26 @@ describe("resolveRailConfig", () => {
     expect(cfg.artifact).toBe("build/index.js");
     expect(cfg.preview).toEqual({ healthPath: "/_health", rootPath: "/status" });
   });
+
+  test("parses deploy.mode: command for multi-binding staging repos (e.g. cloudflare/mcp)", () => {
+    const rail = JSON.stringify({
+      branch: "main",
+      checks: {
+        format: "npm run format:check",
+        lint: "npm run lint",
+        typecheck: "npm run typecheck",
+        test: "npm run test",
+      },
+      deploy: {
+        mode: "command",
+        command: "npm run deploy:forge-tools && npm run deploy",
+        verifyUrl: "https://staging.example.com/health",
+      },
+    });
+    const cfg = resolveRailConfig(rail, null);
+    expect(cfg.deploy.mode).toBe("command");
+    expect(cfg.deploy.command).toBe("npm run deploy:forge-tools && npm run deploy");
+    expect(cfg.deploy.verifyUrl).toBe("https://staging.example.com/health");
+    expect(cfg.checks.map((c) => c.name)).toEqual(["format", "lint", "typecheck", "test"]);
+  });
 });

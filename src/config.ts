@@ -1,3 +1,11 @@
+export interface RailDeployConfig {
+  mode: "worker-loader" | "command";
+  /** Required when mode === "command", e.g. "npm run deploy:forge-tools && npm run deploy" */
+  command?: string;
+  /** Optional post-deploy HTTP probe URL (must return 200), e.g. "https://staging.example.com/health" */
+  verifyUrl?: string;
+}
+
 export interface RailConfig {
   branch: string;
   install: string;
@@ -8,6 +16,7 @@ export interface RailConfig {
     healthPath: string;
     rootPath: string;
   };
+  deploy: RailDeployConfig;
   source: "rail.json" | "package.json";
 }
 
@@ -21,14 +30,19 @@ export interface RailJsonInput {
     healthPath?: string;
     rootPath?: string;
   };
+  deploy?: {
+    mode?: "worker-loader" | "command";
+    command?: string;
+    verifyUrl?: string;
+  };
 }
 
 const DEFAULT_CHECK_ORDER = ["lint", "typecheck", "test", "build"] as const;
 
 /**
  * Resolves pipeline configuration from `rail.json` if present, otherwise auto-detects
- * scripts from `package.json`. Keeps adoption zero-config for existing repos while
- * letting any repo override install, checks, artifact path, or preview probes.
+ * scripts from `package.json`. Supports both zero-binding Worker Loader deploys (default)
+ * and multi-binding staging deploys (`deploy.mode: "command"`).
  */
 export function resolveRailConfig(
   railJsonRaw: string | null,
@@ -51,6 +65,7 @@ export function resolveRailConfig(
         if (scripts[name]) checks.push({ name, command: `npm run ${name}` });
       }
     }
+    const mode = parsed.deploy?.mode === "command" ? "command" : "worker-loader";
     return {
       branch: parsed.branch || "main",
       install: parsed.install || "npm ci --no-audit --no-fund",
@@ -60,6 +75,11 @@ export function resolveRailConfig(
       preview: {
         healthPath: parsed.preview?.healthPath || "/health",
         rootPath: parsed.preview?.rootPath || "/",
+      },
+      deploy: {
+        mode,
+        command: parsed.deploy?.command?.trim() || undefined,
+        verifyUrl: parsed.deploy?.verifyUrl?.trim() || undefined,
       },
       source: "rail.json",
     };
@@ -81,6 +101,9 @@ export function resolveRailConfig(
     preview: {
       healthPath: "/health",
       rootPath: "/",
+    },
+    deploy: {
+      mode: "worker-loader",
     },
     source: "package.json",
   };

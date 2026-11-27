@@ -40,6 +40,9 @@ export interface Env {
   ARTIFACTS_NAMESPACE: string;
   ARTIFACTS_REPO: string;
   PUBLIC_ORIGIN: string;
+  DEPLOY_API_TOKEN?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
+  GITHUB_TOKEN?: string;
 }
 
 export interface ArtifactsPushEvent {
@@ -103,6 +106,7 @@ export interface GateEvidence {
 
 export interface DeployEvidence {
   deployed: boolean;
+  mode?: "worker-loader" | "command";
   deployId?: string;
   bundleKey?: string;
   bundleBytes?: number;

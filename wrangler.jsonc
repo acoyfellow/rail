@@ -3,19 +3,32 @@
   "account_id": "29db7c74093386544fed8046ef083a4b",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-16",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "workers_dev": false,
   "routes": [
-    { "pattern": "rail.customer0.dev", "custom_domain": true }
+    {
+      "pattern": "rail.customer0.dev",
+      "custom_domain": true
+    }
   ],
   "artifacts": [
-    { "binding": "ARTIFACTS", "namespace": "rail" }
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "rail"
+    }
   ],
   "r2_buckets": [
-    { "binding": "STORE", "bucket_name": "rail-store" }
+    {
+      "binding": "STORE",
+      "bucket_name": "rail-store"
+    }
   ],
   "worker_loaders": [
-    { "binding": "LOADER" }
+    {
+      "binding": "LOADER"
+    }
   ],
   "containers": [
     {
@@ -27,14 +40,23 @@
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "SANDBOX", "class_name": "CiSandbox" },
-      { "name": "RAIL", "class_name": "RailDO" }
+      {
+        "name": "SANDBOX",
+        "class_name": "CiSandbox"
+      },
+      {
+        "name": "RAIL",
+        "class_name": "RailDO"
+      }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["CiSandbox", "RailDO"]
+      "new_sqlite_classes": [
+        "CiSandbox",
+        "RailDO"
+      ]
     }
   ],
   "workflows": [
@@ -58,6 +80,19 @@
             "workflow_name": "rail-ci"
           }
         ]
+      },
+      {
+        "type": "cf.artifacts.repo.pushed",
+        "filter": {
+          "namespace": "rail",
+          "repo_name": "staging-demo"
+        },
+        "targets": [
+          {
+            "type": "workflow",
+            "workflow_name": "rail-ci"
+          }
+        ]
       }
     ]
   },
@@ -69,6 +104,8 @@
   },
   "observability": {
     "enabled": true,
-    "logs": { "enabled": true }
+    "logs": {
+      "enabled": true
+    }
   }
 }

@@ -108,6 +108,36 @@ Set any check to `false` to skip it. The receipt records `"configSource": "rail.
 
 ---
 
+---
+
+## Multi-binding staging repos & GitHub webhooks (e.g. `cloudflare/mcp`)
+
+For repos with their own bindings (KV, R2, Service Bindings, OAuth) that deploy via `wrangler deploy --env staging` instead of `WorkerLoader`, set `"deploy": { "mode": "command" }` in `rail.json`:
+
+```json
+{
+  "branch": "main",
+  "checks": {
+    "format": "npm run format:check",
+    "lint": "npm run lint",
+    "typecheck": "npm run typecheck",
+    "test": "npm run test"
+  },
+  "deploy": {
+    "mode": "command",
+    "command": "npm run deploy:forge-tools && npm run deploy",
+    "verifyUrl": "https://<your-staging-url>/health"
+  }
+}
+```
+
+Set a scoped Cloudflare API token as a secret (`wrangler secret put DEPLOY_API_TOKEN`) — it is only injected into the gated `deploy-command` Sandbox step after every parallel check passes, and scrubbed from logs.
+
+To keep pushing to GitHub while running CI/CD on Cloudflare:
+1. `wrangler secret put GITHUB_WEBHOOK_SECRET` (and `GITHUB_TOKEN` if the repo is private).
+2. Add a GitHub `push` webhook pointing at `POST https://<your-rail-host>/webhooks/github?repo=<artifacts-repo>`.
+3. Verified pushes mirror into Cloudflare Artifacts and fire `cf.artifacts.repo.pushed`, producing the exact same `/receipt/:id` and `.json` receipts.
+
 ## Machine receipts & agent loop
 
 Every push produces two URLs:

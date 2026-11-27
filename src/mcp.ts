@@ -55,7 +55,8 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
   if (body.method === "tools/call") {
     const name = String(body.params?.name ?? "");
     const args = (body.params?.arguments ?? {}) as Record<string, unknown>;
-    const railStub = env.RAIL.get(env.RAIL.idFromName(`${env.ARTIFACTS_NAMESPACE}/${env.ARTIFACTS_REPO}/main`));
+    const activeRepo = new URL(request.url).searchParams.get("repo") || env.ARTIFACTS_REPO;
+    const railStub = env.RAIL.get(env.RAIL.idFromName(`${env.ARTIFACTS_NAMESPACE}/${activeRepo}/main`));
 
     if (name === "repo.status") {
       const [production, recent] = await Promise.all([railStub.getProduction(), railStub.listReceipts(1)]);

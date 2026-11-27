@@ -308,6 +308,7 @@ bun run deploy`;
         <button class="tab active" type="button" data-tab="existing">Existing app</button>
         <button class="tab" type="button" data-tab="pi">Pi / Agent</button>
         <button class="tab" type="button" data-tab="new">New app from scratch</button>
+        <button class="tab" type="button" data-tab="staging">GitHub / Staging</button>
         <button class="tab" type="button" data-tab="config">rail.json (optional)</button>
       </div>
 
@@ -342,6 +343,17 @@ bun run deploy`;
         <div class="step-line">
           <span class="step-label">Start from the minimal <code>demo-app/</code> Worker template (includes <code>lint</code>, <code>typecheck</code>, <code>test</code>, <code>build</code>, and <code>/health</code>):</span>
           ${codeBlock(newAppCmd)}
+        </div>
+      </div>
+
+            <div class="pane" id="pane-staging">
+        <div class="step-line">
+          <span class="step-label"><strong>1. Multi-binding staging repos (e.g. <code>cloudflare/mcp</code>)</strong> — add <code>deploy.mode: "command"</code> in <code>rail.json</code> and set <code>DEPLOY_API_TOKEN</code> as a Worker secret:</span>
+          ${codeBlock('{\n  "branch": "main",\n  "checks": {\n    "format": "npm run format:check",\n    "lint": "npm run lint",\n    "typecheck": "npm run typecheck",\n    "test": "npm run test"\n  },\n  "deploy": {\n    "mode": "command",\n    "command": "npm run deploy",\n    "verifyUrl": "https://staging.example.com/health"\n  }\n}')}
+        </div>
+        <div class="step-line">
+          <span class="step-label"><strong>2. Keep pushing to GitHub</strong> — set <code>GITHUB_WEBHOOK_SECRET</code> and point a GitHub push webhook at <code>POST /webhooks/github</code> (HMAC-SHA256 verified → mirrors into Cloudflare Artifacts → triggers the same Workflow &amp; receipt):</span>
+          ${codeBlock("https://rail.customer0.dev/webhooks/github?repo=<ARTIFACTS_REPO>")}
         </div>
       </div>
 
